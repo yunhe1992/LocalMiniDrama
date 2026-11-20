@@ -1,12 +1,13 @@
 name: Release
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - 'v*.*.*'   # 推送 vX.X.X 格式的 tag 时触发
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build-windows:
@@ -16,6 +17,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Fetch bundled sample projects
+        run: git lfs pull --include='example_drama/*.zip' --exclude=''
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -60,8 +64,6 @@ jobs:
       # 标准版（含示例数据）
       - name: Build Standard Installer
         working-directory: desktop
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npx electron-builder --win --publish never
 
       - name: Upload Standard Build Artifacts
@@ -69,12 +71,139 @@ jobs:
         with:
           name: windows-release
           path: desktop/release/*.exe
+          if-no-files-found: error
           retention-days: 7
+
+  build-macos:
+    name: Build macOS DMG (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+            macho_arch: arm64
+            ffmpeg_sha256: a90e3db6a3fd35f6074b013f948b1aa45b31c6375489d39e572bea3f18336584
+            ffprobe_sha256: bb2db6f5d8cef919da12fbf592119a987202a8c060a886f3cab091f9cab90b64
+          - runner: macos-15-intel
+            arch: x64
+            macho_arch: x86_64
+            ffmpeg_sha256: ebdddc936f61e14049a2d4b549a412b8a40deeff6540e58a9f2a2da9e6b18894
+            ffprobe_sha256: fa3add0ce901f7241abe0dfc0155d958fc834aca3f8ce61f87cc712ae669c1e0
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch bundled sample projects
+        run: git lfs pull --include='example_drama/*.zip' --exclude=''
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            frontweb/package-lock.json
+            desktop/package-lock.json
+
+      - name: Build frontend
+        working-directory: frontweb
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: |
+          npm ci
+          npm run copy-front
+
+      - name: Fetch native FFmpeg tools
+        working-directory: desktop/ffmpeg-mac
+        env:
+          TARGET_ARCH: ${{ matrix.arch }}
+          FFMPEG_SHA256: ${{ matrix.ffmpeg_sha256 }}
+          FFPROBE_SHA256: ${{ matrix.ffprobe_sha256 }}
+        run: |
+          release_url=https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1
+          curl -fsSL --retry 3 "$release_url/ffmpeg-darwin-$TARGET_ARCH" -o ffmpeg
+          curl -fsSL --retry 3 "$release_url/ffprobe-darwin-$TARGET_ARCH" -o ffprobe
+          printf '%s  %s\n' "$FFMPEG_SHA256" ffmpeg "$FFPROBE_SHA256" ffprobe | shasum -a 256 --check
+          curl -fsSL --retry 3 "$release_url/darwin-$TARGET_ARCH.LICENSE" -o FFmpeg-LICENSE.txt
+          curl -fsSL --retry 3 "$release_url/darwin-$TARGET_ARCH.README" -o FFmpeg-README.txt
+          chmod +x ffmpeg ffprobe
+
+      - name: Build native DMG
+        working-directory: desktop
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          TARGET_ARCH: ${{ matrix.arch }}
+        run: |
+          test "$(node -p process.arch)" = "$TARGET_ARCH"
+          npx --no-install electron-builder --mac dmg "--$TARGET_ARCH" --config electron-builder-mac.json --publish never
+
+      - name: Verify DMG and bundled binaries
+        working-directory: desktop
+        env:
+          TARGET_ARCH: ${{ matrix.arch }}
+          MACHO_ARCH: ${{ matrix.macho_arch }}
+        run: |
+          version=$(node -p 'require("./package.json").version')
+          dmg="release/LocalMiniDrama-$version-mac-$TARGET_ARCH.dmg"
+          hdiutil verify "$dmg"
+          mount_dir=$(mktemp -d)
+          hdiutil attach -readonly -nobrowse -noautoopen -mountpoint "$mount_dir" "$dmg"
+          trap 'hdiutil detach "$mount_dir"; rmdir "$mount_dir"' EXIT
+          contents="$mount_dir/LocalMiniDrama.app/Contents"
+          app="$contents/MacOS/LocalMiniDrama"
+          lipo "$app" -verify_arch "$MACHO_ARCH"
+          for tool in ffmpeg ffprobe; do
+            binary="$contents/Resources/ffmpeg/$tool"
+            lipo "$binary" -verify_arch "$MACHO_ARCH"
+            "$binary" -version | sed -n '1p'
+          done
+          ELECTRON_RUN_AS_NODE=1 "$app" -e '
+            const root = process.argv[1];
+            const Database = require(root + "/node_modules/better-sqlite3");
+            const database = new Database(":memory:");
+            if (database.prepare("SELECT 1 AS ok").get().ok !== 1) process.exit(1);
+            require(root + "/node_modules/sharp");
+          ' "$contents/Resources/app.asar"
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}-release
+          path: desktop/release/*-mac-${{ matrix.arch }}.dmg
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Create Release Draft
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download installer artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: installers
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: desktop/release/*.exe
+          files: |
+            installers/windows-release/*.exe
+            installers/macos-arm64-release/*.dmg
+            installers/macos-x64-release/*.dmg
+          fail_on_unmatched_files: true
           generate_release_notes: true
           draft: true   # 先创建草稿，人工审核后手动发布
         env:
