@@ -50,6 +50,8 @@ export function canUseUniversalOmniVideoApi(cfg) {
   if (proto === 'kling_omni') return true
   // 选了 volcengine_omni 即表示走多图参考；模型名可能是 996 等网关别名（如 mingiz-sd2），勿再按 seedance 字样拦截
   if (proto === 'volcengine_omni') return true
+  // 自建 H3 网关：已接 ref2va，最多 9 张参考图（场景/角色/道具）
+  if (proto === 'minimax_h3_gateway' || provider === 'minimax_h3_gateway') return true
   if (proto === 'agnes' || provider === 'agnes' || /agnes-video/.test(model)) {
     return true
   }

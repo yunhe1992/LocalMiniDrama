@@ -373,6 +373,7 @@
             <el-option label="可灵 Omni-Video（官方 api-beijing / ffir 中转，O1 全能）" value="kling_omni" />
             <el-option label="xAI Grok Imagine（官方 prompt + aspect_ratio，/v1/videos/generations）" value="xai" />
             <el-option label="MiniMax H3（官方 V2：/v2/video_generation，模型 MiniMax-H3）" value="minimax_h3" />
+            <el-option label="MiniMax H3 自建网关（OpenAI Videos：/v1/videos，最多 9 张参考图）" value="minimax_h3_gateway" />
             <el-option label="NanoBanana" value="nano_banana" />
           </el-select>
         </el-form-item>
@@ -1655,6 +1656,8 @@ const endpointPreviewInfo = computed(() => {
       submitPath = '/videos'
     } else if (proto === 'minimax_h3' || p === 'minimax_h3') {
       submitPath = '/v2/video_generation'
+    } else if (proto === 'minimax_h3_gateway' || p === 'minimax_h3_gateway') {
+      submitPath = '/videos'
     } else if (proto === 'xai') {
       submitPath = '/v1/videos/generations'
     } else if (proto === 'veo3') {
@@ -1697,6 +1700,8 @@ const endpointPreviewInfo = computed(() => {
         : '/videos/{taskId}'
     } else if (proto === 'minimax_h3' || p === 'minimax_h3') {
       queryPath = '/v2/query/video_generation/{taskId}'
+    } else if (proto === 'minimax_h3_gateway' || p === 'minimax_h3_gateway') {
+      queryPath = '/videos/{taskId}'
     } else if (proto === 'xai') {
       queryPath = '/v1/videos/{taskId}'
     } else if (proto === 'veo3') {

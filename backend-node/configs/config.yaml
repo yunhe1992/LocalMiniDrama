@@ -21,8 +21,10 @@ storage:
   local_path: ./data/storage
   base_url: http://localhost:5679/static
 # 异步视频任务轮询总超时（分钟）；省略或 ≤0 时默认 30
+# 自建 H3 网关的 ref2va 是单 worker 串行，15 秒片段排队后整批要 40 分钟以上，
+# 30 分钟会把还在队列里的任务误判为超时。
 video:
-  generation_timeout_minutes: 30
+  generation_timeout_minutes: 120
 ai:
   default_text_provider: openai
   default_image_provider: openai

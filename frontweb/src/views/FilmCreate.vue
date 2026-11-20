@@ -7164,7 +7164,10 @@ function pollTaskWithPause(taskId, onDone, meta = {}) {
   if (trackInStore && taskId) {
     genStore.markRunning({ ...resolvedMeta, taskId })
   }
-  const maxAttempts = 450  // 450 × 2s = 15 分钟
+  // 上限须高于后端 video.generation_timeout_minutes：自建 H3 网关的 ref2va 是单
+  // worker 串行，整批排队能到一小时以上。这里先到点就会让 pipelineWithRetry 重新
+  // 提交同一个分镜，白白多烧几段 GPU。
+  const maxAttempts = 3900  // 3900 × 2s = 130 分钟
   const interval = 2000
   let attempts = 0
   return new Promise((resolve, reject) => {
@@ -7208,7 +7211,7 @@ function pollTaskWithPause(taskId, onDone, meta = {}) {
       }
       if (attempts < maxAttempts) setTimeout(tick, interval)
       else {
-        const timeoutMsg = '任务查询超时（超过15分钟）'
+        const timeoutMsg = `任务查询超时（超过${Math.round((maxAttempts * interval) / 60000)}分钟）`
         finishStore('failed', timeoutMsg)
         resolve({ status: 'timeout', error: timeoutMsg })
       }

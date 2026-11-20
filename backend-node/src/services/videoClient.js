@@ -36,6 +36,7 @@ function inferVideoProtocol(provider) {
   if (p === 'xai' || p === 'grok') return 'xai';
   if (p === 'agnes') return 'agnes';
   if (p === 'minimax_h3') return 'minimax_h3';
+  if (p === 'minimax_h3_gateway') return 'minimax_h3_gateway';
   return 'openai';
 }
 
@@ -152,6 +153,42 @@ function buildCheapSeedance2ContentUrl(config, taskId) {
 }
 
 /**
+ * 自建 H3 网关（OpenAI Videos 形态）：POST {base}/v1/videos，收 prompt / model / seed /
+ * seconds / size 与参考图，多余字段会被上游拒绝；完成后无直链，需带鉴权
+ * GET {base}/v1/videos/{id}/content。
+ * 与官方 MiniMax H3 的 /v2/video_generation 是两套协议，故单独成一个规范。
+ */
+function isMinimaxH3GatewayProtocol(config) {
+  return String(config?.api_protocol || '').trim().toLowerCase() === 'minimax_h3_gateway';
+}
+
+function buildMinimaxH3GatewayUrl(config) {
+  const base = String(config?.base_url || '').replace(/\/+$/, '');
+  let ep = String(config?.endpoint || '/v1/videos').trim();
+  if (!ep.startsWith('/')) ep = '/' + ep;
+  return base + ep;
+}
+
+function buildMinimaxH3GatewayPollUrl(config, taskId) {
+  const base = String(config?.base_url || '').replace(/\/+$/, '');
+  const id = String(taskId || '').trim();
+  if (!id) return null;
+  let ep = String(config?.query_endpoint || '/v1/videos/{taskId}').trim();
+  if (!ep.startsWith('/')) ep = '/' + ep;
+  ep = ep
+    .replace(/\{taskId\}/gi, encodeURIComponent(id))
+    .replace(/\{task_id\}/gi, encodeURIComponent(id))
+    .replace(/\{id\}/gi, encodeURIComponent(id));
+  return base + ep;
+}
+
+function buildMinimaxH3GatewayContentUrl(config, taskId) {
+  const poll = buildMinimaxH3GatewayPollUrl(config, taskId);
+  if (!poll) return null;
+  return poll.replace(/\/+$/, '') + '/content';
+}
+
+/**
  * 官方模型 ID：MiniMax-H3（Video Generation V2）。
  * 工作台别名（mb-minimax-h3-*、minimax-h3-480p 等）不是官方接口，不能改写成 MiniMax-H3。
  */
@@ -188,7 +225,11 @@ function resolveVideoProtocol(config, modelHint) {
     if (!ex || ex === 'openai' || ex === 'minimax_h3' || protocol === 'minimax_h3') return 'sora';
     return protocol;
   }
-  if ((!explicit || protocol === 'openai') && (provider === 'minimax_h3' || isMinimaxH3Model(modelCand))) {
+  if (
+    (!explicit || protocol === 'openai') &&
+    provider !== 'minimax_h3_gateway' &&
+    (provider === 'minimax_h3' || isMinimaxH3Model(modelCand))
+  ) {
     protocol = 'minimax_h3';
   }
   return protocol;
@@ -1203,6 +1244,7 @@ function buildQueryUrl(config, taskId, extras = {}) {
   if (isVolc) return getVolcVideoBase(config) + VOLC_VIDEO_QUERY_PATH + '/' + encodeURIComponent(taskId);
   if (proto === 'agnes') return buildAgnesPollUrl(config, taskId, extras.model);
   if (proto === 'minimax_h3') return buildMinimaxH3PollUrl(config, taskId);
+  if (proto === 'minimax_h3_gateway') return buildMinimaxH3GatewayPollUrl(config, taskId);
   const base = (config.base_url || '').replace(/\/$/, '');
   let defaultEp;
   if (isSora) defaultEp = '/v1/videos/{taskId}';
@@ -3303,6 +3345,237 @@ async function callSoraVideoApi(config, log, opts) {
   return { error: 'Sora ??? task_id ? video_url???: ' + JSON.stringify(data).slice(0, 300) };
 }
 
+/**
+ * 参考图字节 → data URI。网关会把参考图缩到 2048 长边再重编码，且整个请求体上限
+ * 12 MiB，所以这里先按 2048 长边下采样并转 JPEG：分镜原图 3 MB 级，九张原图会直接
+ * 超限，压完九张也只有几 MB，画质损失落在网关本来就会丢弃的那部分上。
+ */
+async function minimaxH3GatewayDataUri(buf, video_gen_id, log, fallbackMime) {
+  const mime = /^image\/(png|jpeg|webp)$/i.test(String(fallbackMime || '')) ? fallbackMime : 'image/png';
+  const inline = () => 'data:' + mime + ';base64,' + buf.toString('base64');
+  if (!sharp) return inline();
+  try {
+    const info = await sharp(buf, { animated: false }).metadata();
+    const longest = Math.max(info.width || 0, info.height || 0);
+    if (!longest) return inline();
+    const pipeline = sharp(buf, { animated: false });
+    if (longest > 2048) pipeline.resize({ width: 2048, height: 2048, fit: 'inside', withoutEnlargement: true });
+    const hasAlpha = Boolean(info.hasAlpha);
+    if (hasAlpha) {
+      const out = await pipeline.png({ compressionLevel: 9 }).toBuffer();
+      return 'data:image/png;base64,' + out.toString('base64');
+    }
+    const out = await pipeline.jpeg({ quality: 88, mozjpeg: true }).toBuffer();
+    return 'data:image/jpeg;base64,' + out.toString('base64');
+  } catch (e) {
+    log.warn('[MiniMaxH3Gateway] 参考图压缩失败，按原图上传', { video_gen_id, error: e.message });
+    return inline();
+  }
+}
+
+/** 参考图 URL / 本地路径 → data URI（H3 网关只接受 base64 data URI，不抓取 URL） */
+async function resolveMinimaxH3GatewayImage(rawUrl, files_base_url, storage_local_path, log, video_gen_id) {
+  const raw = String(rawUrl || '').trim();
+  if (!raw) return null;
+  if (raw.startsWith('data:')) return raw;
+  if (/localhost|127\.0\.0\.1/i.test(raw) && storage_local_path) {
+    const baseUrl = (files_base_url || '').replace(/\/$/, '');
+    const afterStatic = raw.split('/static/')[1] || (baseUrl ? raw.replace(baseUrl + '/', '').replace(baseUrl, '') : null);
+    const relPath = afterStatic ? afterStatic.replace(/^\//, '') : null;
+    if (relPath) {
+      try {
+        const buf = await fs.promises.readFile(path.join(storage_local_path, relPath));
+        const ext = path.extname(relPath).toLowerCase();
+        const mime = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp' }[ext] || 'image/png';
+        return await minimaxH3GatewayDataUri(buf, video_gen_id, log, mime);
+      } catch (e) {
+        log.warn('[MiniMaxH3Gateway] 本地参考图读取失败', { video_gen_id, error: e.message });
+        return null;
+      }
+    }
+  }
+  if (!/^https?:\/\//i.test(raw)) return null;
+  try {
+    const res = await fetch(raw);
+    if (!res.ok) {
+      log.warn('[MiniMaxH3Gateway] 参考图下载失败', { video_gen_id, status: res.status });
+      return null;
+    }
+    const mime = (res.headers.get('content-type') || '').split(';')[0].trim();
+    if (!/^image\/(png|jpeg|webp)$/i.test(mime)) {
+      log.warn('[MiniMaxH3Gateway] 参考图类型不支持', { video_gen_id, mime });
+      return null;
+    }
+    return await minimaxH3GatewayDataUri(Buffer.from(await res.arrayBuffer()), video_gen_id, log, mime);
+  } catch (e) {
+    log.warn('[MiniMaxH3Gateway] 参考图拉取异常', { video_gen_id, error: e.message });
+    return null;
+  }
+}
+
+/**
+ * 自建 H3 网关的时长：ref2va 接受 5/10/15 秒，标准档只接受 5 秒。
+ * 取不超过请求时长的最大档，避免分镜的 15~17 秒被网关默认成 5 秒。
+ */
+function gatewayVideoSeconds(multiReference, duration, log, video_gen_id) {
+  const wanted = Number(duration);
+  if (!Number.isFinite(wanted) || wanted <= 0) return null;
+  const allowed = multiReference ? [15, 10, 5] : [5];
+  const pick = allowed.find((s) => s <= Math.floor(wanted));
+  if (!pick) return String(allowed[allowed.length - 1]);
+  if (pick !== Math.floor(wanted)) {
+    log.info('[MiniMaxH3Gateway] 时长归一到网关支持档位', {
+      video_gen_id, requested: duration, seconds: pick,
+    });
+  }
+  return String(pick);
+}
+
+/** 画幅 → 网关 size：只有 16:9 与 9:16 两档，其余交给网关默认 */
+function gatewayVideoSize(aspect_ratio) {
+  const normalized = normalizeAspectRatioForApi(aspect_ratio);
+  if (normalized === '16:9') return '1024x576';
+  if (normalized === '9:16') return '576x1024';
+  return null;
+}
+
+/** ref2va 队列满时的提交退避：最多重试次数与单次等待上限 */
+const GATEWAY_429_MAX_ATTEMPTS = 40;
+const GATEWAY_429_MAX_WAIT_MS = 60000;
+
+/** 解析 Retry-After（秒或 HTTP-date），缺失或异常时回退到固定退避 */
+function gatewayRetryAfterMs(header, maxMs) {
+  const raw = String(header || '').trim();
+  // Number('') is 0, so an absent header has to be detected before parsing. The
+  // gateway says 30 seconds; magpie drops the header, hence the same fallback.
+  let seconds;
+  if (!raw) {
+    seconds = 30;
+  } else if (/^[0-9]+$/.test(raw)) {
+    seconds = Number(raw);
+  } else {
+    const date = Date.parse(raw);
+    seconds = Number.isNaN(date) ? 30 : Math.round((date - Date.now()) / 1000);
+  }
+  return Math.min(maxMs, Math.max(1000, Math.round(seconds) * 1000));
+}
+
+/**
+ * 自建 H3 网关：OpenAI Videos 形态的异步任务。
+ * 提交网关接受的字段（prompt / seed / model / seconds / size，及可选的 reference_images
+ * 或 image 首帧）。完成态没有直链，由轮询侧拼 /content。
+ */
+async function callMinimaxH3GatewayVideoApi(config, log, opts) {
+  const { prompt, model, reference_urls, files_base_url, storage_local_path } = opts;
+  const url = buildMinimaxH3GatewayUrl(config);
+  const resolvedModel = pickModelId(model || getModelFromConfig(config));
+  const body = { prompt: String(prompt || '').trim() };
+  if (resolvedModel) body.model = resolvedModel;
+  if (opts.seed != null && opts.seed !== '') {
+    const seed = Number(opts.seed);
+    if (Number.isFinite(seed)) body.seed = Math.trunc(seed);
+  }
+  // ref2va caps at nine references; the gateway lowers the reference encoder's
+  // short edge as the count grows, so three or more still fit two 24 GB cards.
+  const refList = Array.isArray(reference_urls) ? reference_urls.filter(Boolean).map(String).slice(0, 9) : [];
+  // The gateway rejects bodies over 12 MiB, and a storyboard frame is a few MB,
+  // so the count is capped by payload bytes as well as by ref2va's own limit.
+  const MAX_GATEWAY_IMAGE_BYTES = 10 * 1024 * 1024;
+  const images = [];
+  let imageBytes = 0;
+  for (const item of refList) {
+    const dataUri = await resolveMinimaxH3GatewayImage(
+      item, files_base_url, storage_local_path, log, opts.video_gen_id
+    );
+    if (!dataUri) continue;
+    if (imageBytes + dataUri.length > MAX_GATEWAY_IMAGE_BYTES) {
+      log.warn('[MiniMaxH3Gateway] 参考图累计体积超过网关上限，后续已丢弃', {
+        video_gen_id: opts.video_gen_id, kept: images.length, bytes: imageBytes,
+      });
+      break;
+    }
+    imageBytes += dataUri.length;
+    images.push(dataUri);
+  }
+  if (images.length > 1) {
+    body.reference_images = images;
+  } else if (images.length === 1) {
+    body.image = images[0];
+  } else {
+    const firstFrame = (opts.first_frame_url || opts.first_frame_local_path || opts.image_url || '').trim();
+    if (firstFrame) {
+      const dataUri = await resolveMinimaxH3GatewayImage(
+        firstFrame, files_base_url, storage_local_path, log, opts.video_gen_id
+      );
+      if (dataUri) body.image = dataUri;
+    }
+  }
+  // 多张参考图会被网关转给 ref2va，它支持 5/10/15 秒；单图与纯文本走标准档，
+  // 只支持 5 秒。按实际落点取档，否则分镜的 15~17 秒会被默认成 5 秒。
+  const multiReference = images.length > 1;
+  const seconds = gatewayVideoSeconds(multiReference, opts.duration, log, opts.video_gen_id);
+  if (seconds) body.seconds = seconds;
+  const size = gatewayVideoSize(opts.aspect_ratio);
+  if (size) body.size = size;
+  const headers = {
+    'Content-Type': 'application/json',
+    Authorization: 'Bearer ' + (config.api_key || ''),
+  };
+  log.info('[MiniMaxH3Gateway] Video POST', {
+    url,
+    model: resolvedModel,
+    video_gen_id: opts.video_gen_id,
+    body_keys: Object.keys(body),
+  });
+  // ref2va renders one clip at a time and answers 429 once its queue is full, so
+  // back off and resubmit instead of failing the storyboard.
+  let res;
+  let raw = '';
+  for (let attempt = 0; ; attempt++) {
+    try {
+      res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
+    } catch (e) {
+      return { error: '视频接口连接失败: ' + formatNetError(e) };
+    }
+    if (res.status !== 429 || attempt >= GATEWAY_429_MAX_ATTEMPTS) {
+      raw = await res.text();
+      break;
+    }
+    const waitMs = gatewayRetryAfterMs(res.headers.get('retry-after'), GATEWAY_429_MAX_WAIT_MS);
+    log.warn('[MiniMaxH3Gateway] 网关队列已满，退避后重试', {
+      video_gen_id: opts.video_gen_id, attempt: attempt + 1, wait_ms: waitMs,
+    });
+    await new Promise((r) => setTimeout(r, waitMs));
+  }
+  log.info('[MiniMaxH3Gateway] raw response', {
+    status: res.status,
+    raw: raw.slice(0, 1200),
+    video_gen_id: opts.video_gen_id,
+  });
+  if (!res.ok) {
+    let errMsg = 'MiniMax H3 网关提交失败: ' + res.status;
+    try {
+      const errJson = JSON.parse(raw);
+      const msg = errJson.error?.message || errJson.message || errJson.error;
+      if (msg) errMsg += ' - ' + (typeof msg === 'string' ? msg : JSON.stringify(msg).slice(0, 200));
+    } catch (_) {
+      if (raw) errMsg += ' - ' + raw.slice(0, 200);
+    }
+    return { error: errMsg };
+  }
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch (e) {
+    return { error: 'MiniMax H3 网关响应非 JSON: ' + e.message + ' | raw: ' + raw.slice(0, 200) };
+  }
+  const directUrl = pickProxyVideoUrl(data);
+  if (directUrl) return { video_url: directUrl };
+  const taskId = data.id || data.task_id || data.request_id || data.data?.id || data.data?.task_id;
+  if (taskId) return { task_id: String(taskId), status: data.status || 'queued' };
+  return { error: 'MiniMax H3 网关未返回 task_id 或 video_url: ' + JSON.stringify(data).slice(0, 300) };
+}
+
 function isJimengFreeApiSeedanceModel(model) {
   const m = String(model || '').toLowerCase();
   return m.includes('seedance');
@@ -4408,6 +4681,11 @@ async function callVideoApi(db, log, opts) {
     });
   }
 
+  // 自建 H3 网关（OpenAI Videos 形态）
+  if (protocol === 'minimax_h3_gateway') {
+    return callMinimaxH3GatewayVideoApi(config, log, opts);
+  }
+
   const url = buildVideoUrl(config);
   const dur = duration ? Number(duration) : 5;
   const ratio = aspect_ratio || '16:9';
@@ -4565,6 +4843,7 @@ async function pollVideoTask(db, log, videoGenId, taskId, config, maxAttempts = 
   const isSora = protocol === 'sora';
   const isAgnes = protocol === 'agnes';
   const isMinimaxH3 = protocol === 'minimax_h3';
+  const isMinimaxH3Gateway = protocol === 'minimax_h3_gateway';
   const isKling = protocol === 'kling';
   const isKlingOmni = protocol === 'kling_omni' || (typeof taskId === 'string' && taskId.startsWith('omni:'));
   const isVeo3 = protocol === 'veo3';
@@ -4896,6 +5175,35 @@ async function pollVideoTask(db, log, videoGenId, taskId, config, maxAttempts = 
         continue;
       }
 
+      if (isMinimaxH3Gateway) {
+        const status = extractPollTaskStatus(data);
+        log.info('[MiniMaxH3Gateway poll] 状态', {
+          video_gen_id: videoGenId,
+          attempt,
+          status,
+          id: data.id || taskId,
+        });
+        if (isPollTaskFailed(status)) {
+          const msg = extractPollFailureMessage(data) || 'MiniMax H3 任务失败';
+          return { error: String(msg).slice(0, 500) };
+        }
+        const videoUrl = pickProxyVideoUrl(data);
+        if (videoUrl && isPlausibleHttpVideoUrl(videoUrl)) {
+          return { video_url: videoUrl };
+        }
+        if (status === 'succeeded' || status === 'completed' || status === 'success' || status === 'done') {
+          const contentUrl = buildMinimaxH3GatewayContentUrl(config, data.id || pollTaskId);
+          if (contentUrl) {
+            log.info('[MiniMaxH3Gateway poll] 完成，使用 content 地址', {
+              video_gen_id: videoGenId,
+              video_url: contentUrl,
+            });
+            return { video_url: contentUrl };
+          }
+        }
+        continue;
+      }
+
       if (isVidu) {
         const state = (data?.state || data?.status || data?.data?.status || '').toLowerCase();
         log.info('[Vidu poll] ????', { video_gen_id: videoGenId, attempt, state, id: taskId });
@@ -5020,6 +5328,12 @@ module.exports = {
   extractMinimaxH3VideoUrl,
   normalizeMinimaxH3Duration,
   normalizeMinimaxH3Resolution,
+  isMinimaxH3GatewayProtocol,
+  buildMinimaxH3GatewayUrl,
+  buildMinimaxH3GatewayPollUrl,
+  buildMinimaxH3GatewayContentUrl,
+  gatewayRetryAfterMs,
+  resolveVideoProtocol,
   isCheapSeedance2Provider,
   configSupportsUniversalOmni,
   normalizeCheapSeedance2Duration,

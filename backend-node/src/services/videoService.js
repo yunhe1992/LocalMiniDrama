@@ -231,7 +231,10 @@ function resolveStoragePath(cfg) {
 async function finalizeSuccessfulVideo(db, log, videoGenId, row, rowForAspect, videoUrl, logLabel, aiConfig = null) {
   const now = new Date().toISOString();
   let localPath = null;
-  const requireAuthDownload = videoClient.isCheapSeedance2Provider(aiConfig?.provider || row?.provider);
+  const protocol = aiConfig ? videoClient.resolveVideoProtocol(aiConfig, row?.model) : '';
+  const requireAuthDownload =
+    videoClient.isCheapSeedance2Provider(aiConfig?.provider || row?.provider) ||
+    protocol === 'minimax_h3_gateway';
   const downloadOpts = requireAuthDownload && aiConfig?.api_key
     ? { apiKey: aiConfig.api_key }
     : null;
